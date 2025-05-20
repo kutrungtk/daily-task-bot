@@ -1,256 +1,249 @@
-import datetime as dt
-from datetime import datetime
-import pytz
-from telegram import (
-    Update, ReplyKeyboardMarkup,
-    InlineKeyboardMarkup, InlineKeyboardButton
-)
+import re
+import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackContext
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from models import SessionLocal, Task, DailyStatus
 import config
 
+# ——————————————————————————————————————————————
+# Utility: tách args của addtask/edittask
+def parse_task_args(text: str):
+    """
+    Tách chuỗi "/cmd …" thành:
+      - name
+      - url (http…)
+      - due_date (dd-mm-yyyy)
+      - due_time (HH:MM)
+    """
+    tokens = text.strip().split()[1:]
+    name_parts, url, due_date, due_time = [], None, None, None
+
+    for tok in tokens:
+        if tok.startswith("http://") or tok.startswith("https://"):
+            url = tok
+        elif re.match(r"^\d{1,2}-\d{1,2}-\d{4}$", tok):
+            due_date = datetime.datetime.strptime(tok, "%d-%m-%Y").date()
+        elif re.match(r"^\d{1,2}:\d{2}$", tok):
+            h, m = map(int, tok.split(":"))
+            due_time = datetime.time(h, m)
+        else:
+            name_parts.append(tok)
+
+    name = " ".join(name_parts).strip()
+    return name, url, due_date, due_time
+
+# ——————————————————————————————————————————————
+# Đảm bảo mỗi ngày có record status
 def ensure_today(session):
-    today = dt.date.today()
+    today = datetime.date.today()
     for t in session.query(Task).all():
         if not session.query(DailyStatus).filter_by(task_id=t.id, date=today).first():
             session.add(DailyStatus(task_id=t.id, date=today, done=False))
     session.commit()
 
+# ——————————————————————————————————————————————
+# START command
 def start(update: Update, ctx: CallbackContext):
-    user = update.effective_user
-    name = user.first_name or user.username or "bạn"
-    session = SessionLocal()
-    if session.query(Task).count() == 0:
-        for n in ["Săn airdrop", "Research", "Viết bài X.com", "Chạy automation"]:
-            session.add(Task(name=n))
-        session.commit()
-    session.close()
+    chat_id = update.effective_chat.id
+    print(f"[Start] chat_id = {chat_id}")
 
+    # Chào + hướng dẫn
     text = (
-        f"👋 Xin chào *{name}*!\n"
-        "Dùng các lệnh:\n\n"
-        "• 📋 `/tasks`                      — Xem công việc hôm nay\n"
-        "• 📜 `/list`                       — Xem toàn bộ Task\n"
-        "• ➕ `/addtask Tên URL [DD-MM-YYYY] [HH:MM]` — Thêm Task mới\n"
-        "• ➖ `/removetask <số>`            — Xóa Task theo thứ tự hôm nay\n"
-        "• ✅ `/done <số>`                   — Đánh dấu / bỏ đánh dấu\n"
-        "• 📊 `/status`                    — Xem tiến độ hôm nay\n"
-        "• 🔔 `/testreminder`              — Test nhắc ngay lập tức\n"
-        "• ❓ `/help`                       — Hướng dẫn sử dụng\n"
+        "👋 Xin chào! Tôi giúp bạn nhắc việc mỗi ngày.\n"
+        "Hãy thêm công việc của bạn bằng lệnh:\n"
+        "  /addtask <Tên công việc> [Link] [DD-MM-YYYY] [HH:MM]\n\n"
+        "Sau đó dùng:\n"
+        "  /tasks — xem công việc hôm nay\n"
+        "  /list  — xem tất cả Task\n"
+        "  /done <số> — đánh dấu/bỏ đánh dấu\n"
+        "  /removetask <số> — xoá\n"
+        "  /edittask <số> <Tên mới> [Link] [DD-MM-YYYY] [HH:MM]\n"
+        "  /status — xem tiến độ\n"
+        "  /help — hướng dẫn\n"
     )
-    update.message.reply_text(text, parse_mode="Markdown")
-
-    keyboard = [
-        ["/tasks", "/status", "/list"],
-        ["/addtask", "/removetask", "/done"],
-        ["/testreminder", "/help"]
+    # Custom keyboard
+    buttons = [
+        ["/tasks", "/list"],
+        ["/addtask", "/removetask"],
+        ["/done", "/edittask"],
+        ["/status", "/help"],
     ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
-    update.message.reply_text("Hoặc bấm nhanh một trong các nút:", reply_markup=reply_markup)
+    update.message.reply_text(text, reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True))
 
+    # Gửi nhắc ngay
+    do_reminder(ctx)
+
+# ——————————————————————————————————————————————
+# Xem danh sách hôm nay
 def tasks(update: Update, ctx: CallbackContext):
     session = SessionLocal()
     ensure_today(session)
-    today = dt.date.today()
+    today = datetime.date.today()
     statuses = session.query(DailyStatus).filter_by(date=today).all()
+
+    lines = []
     for i, st in enumerate(statuses):
-        t = st.task
         icon = "✅" if st.done else "❌"
-        line = f"{i+1}. {icon} *{t.name}*"
-        if t.deadline:
-            line += f" _(due {t.deadline:%d-%m-%Y %H:%M})_"
-        buttons = []
-        if t.link:
-            buttons.append(InlineKeyboardButton("🔗 Hướng dẫn", url=t.link))
-        if buttons:
-            update.message.reply_text(
-                line,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([buttons])
-            )
-        else:
-            update.message.reply_text(line, parse_mode="Markdown")
+        lines.append(f"{i+1}. {icon} {st.task.name}")
+
+    update.message.reply_text("📋 Công việc hôm nay:\n" + "\n".join(lines))
     session.close()
 
+# ——————————————————————————————————————————————
+# Xem toàn bộ Task (không theo ngày)
 def list_tasks(update: Update, ctx: CallbackContext):
     session = SessionLocal()
     tasks = session.query(Task).all()
-    if not tasks:
-        session.close()
-        return update.message.reply_text("📜 Chưa có Task nào cả.")
-    for t in tasks:
-        line = f"*{t.id}.* {t.name}"
-        if t.deadline:
-            line += f" _(due {t.deadline:%d-%m-%Y %H:%M})_"
-        buttons = []
-        if t.link:
-            buttons.append(InlineKeyboardButton("🔗 Hướng dẫn", url=t.link))
-        if buttons:
-            update.message.reply_text(
-                line,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([buttons])
-            )
-        else:
-            update.message.reply_text(line, parse_mode="Markdown")
+    lines = [f"{i+1}. {t.name}"]
+    update.message.reply_text("📁 Toàn bộ Task:\n" + "\n".join(lines))
     session.close()
 
+# ——————————————————————————————————————————————
+# Thêm Task mới
 def addtask(update: Update, ctx: CallbackContext):
-    args = ctx.args
-    link_idx = next((i for i,a in enumerate(args) if a.startswith("http")), None)
-    if link_idx is None or link_idx == 0:
-        return update.message.reply_text(
-            "❗️ Dùng: `/addtask Tên công việc URL [DD-MM-YYYY] [HH:MM]`",
-            parse_mode="Markdown"
-        )
-    name = " ".join(args[:link_idx])
-    link = args[link_idx]
-    deadline = None
-    tail = args[link_idx+1:]
-    if tail:
-        ds = " ".join(tail)
-        for fmt in ("%d-%m-%Y %H:%M", "%d-%m-%Y"):
-            try:
-                deadline = datetime.strptime(ds, fmt)
-                break
-            except ValueError:
-                continue
-        else:
-            return update.message.reply_text(
-                "❗️ Định dạng deadline sai, phải `DD-MM-YYYY` hoặc `DD-MM-YYYY HH:MM`",
-                parse_mode="Markdown"
-            )
-    session = SessionLocal()
-    if session.query(Task).filter_by(name=name).first():
-        msg = f"⚠️ Task *{name}* đã tồn tại."
-    else:
-        task = Task(name=name, link=link, deadline=deadline)
-        session.add(task)
-        session.commit()
-        msg = f"✅ Đã thêm Task: *{name}*"
-    session.close()
-    update.message.reply_text(msg, parse_mode="Markdown")
+    text = update.message.text
+    name, url, due_date, due_time = parse_task_args(text)
+    if not name:
+        return update.message.reply_text("❗️Dùng /addtask <Tên> [Link] [DD-MM-YYYY] [HH:MM]")
 
-def removetask(update: Update, ctx: CallbackContext):
-    if not ctx.args or not ctx.args[0].isdigit():
-        return update.message.reply_text("❗️ Dùng `/removetask <số>` nhé!", parse_mode="Markdown")
-    idx = int(ctx.args[0]) - 1
     session = SessionLocal()
-    today = dt.date.today()
-    statuses = session.query(DailyStatus).filter_by(date=today).all()
-    if not (0 <= idx < len(statuses)):
-        session.close()
-        return update.message.reply_text(
-            "⚠️ Số không hợp lệ. Nhớ xem `/tasks`.",
-            parse_mode="Markdown"
-        )
-    task = statuses[idx].task
-    session.delete(task)
+    # Tạo record Task
+    t = Task(name=name, url=url, due_date=due_date, due_time=due_time)
+    session.add(t)
     session.commit()
     session.close()
-    update.message.reply_text(f"🗑️ Đã xoá: *{task.name}*", parse_mode="Markdown")
+    update.message.reply_text(f"✅ Đã thêm Task: {name}")
 
-def done(update: Update, ctx: CallbackContext):
+# ——————————————————————————————————————————————
+# Xoá Task hôm nay
+def removetask(update: Update, ctx: CallbackContext):
     if not ctx.args or not ctx.args[0].isdigit():
-        return update.message.reply_text("❗️ Dùng `/done <số>` nhé!", parse_mode="Markdown")
+        return update.message.reply_text("❗️Dùng /removetask <số thứ tự hôm nay>")
     idx = int(ctx.args[0]) - 1
     session = SessionLocal()
-    ensure_today(session)
-    today = dt.date.today()
+    today = datetime.date.today()
     statuses = session.query(DailyStatus).filter_by(date=today).all()
-    if not (0 <= idx < len(statuses)):
+    if idx<0 or idx>=len(statuses):
         session.close()
-        return update.message.reply_text("⚠️ Số không hợp lệ.", parse_mode="Markdown")
-    st = statuses[idx]
-    if st.done:
-        st.done = False
-        session.commit()
-        text = f"↩️ Bỏ dấu *{st.task.name}*."
-    else:
-        st.done = True
-        session.commit()
-        text = f"🎉 *{st.task.name}* xong!"
+        return update.message.reply_text("❗️Số không hợp lệ.")
+    t = statuses[idx].task
+    session.delete(t)
+    session.commit()
     session.close()
-    update.message.reply_text(text, parse_mode="Markdown")
+    update.message.reply_text(f"✅ Đã xoá Task: {t.name}")
 
+# ——————————————————————————————————————————————
+# Đánh dấu hoặc bỏ dấu
+def done(update: Update, ctx: CallbackContext):
+    if not ctx.args or not ctx.args[0].isdigit():
+        return update.message.reply_text("❗️Dùng /done <số thứ tự hôm nay>")
+    idx = int(ctx.args[0]) - 1
+    session = SessionLocal()
+    today = datetime.date.today()
+    statuses = session.query(DailyStatus).filter_by(date=today).all()
+    if idx<0 or idx>=len(statuses):
+        session.close()
+        return update.message.reply_text("❗️Số không hợp lệ.")
+    st = statuses[idx]
+    st.done = not st.done
+    session.commit()
+    emoji = "✅" if st.done else "❌"
+    update.message.reply_text(f"{emoji} {st.task.name}")
+    session.close()
+
+# ——————————————————————————————————————————————
+# Chỉnh sửa Task
+def edittask(update: Update, ctx: CallbackContext):
+    text = update.message.text
+    parts = text.strip().split()
+    if len(parts)<2 or not parts[1].isdigit():
+        return update.message.reply_text("❗️Dùng /edittask <số hôm nay> <Tên mới> [Link] [DD-MM-YYYY] [HH:MM]")
+    idx = int(parts[1]) - 1
+    # parse phần còn lại
+    name, url, due_date, due_time = parse_task_args(text.partition(" ")[2])
+
+    session = SessionLocal()
+    today = datetime.date.today()
+    statuses = session.query(DailyStatus).filter_by(date=today).all()
+    if idx<0 or idx>=len(statuses):
+        session.close()
+        return update.message.reply_text("❗️Số không hợp lệ.")
+
+    st = statuses[idx]
+    if name:      st.task.name = name
+    if url:       st.task.url = url
+    if due_date:  st.task.due_date = due_date
+    if due_time:  st.task.due_time = due_time
+    session.commit()
+    session.close()
+    update.message.reply_text(f"✅ Đã sửa Task #{idx+1}: {name}")
+
+# ——————————————————————————————————————————————
+# Xem tiến độ hôm nay (text vui)
 def status(update: Update, ctx: CallbackContext):
     session = SessionLocal()
-    ensure_today(session)
-    today = dt.date.today()
+    today = datetime.date.today()
     statuses = session.query(DailyStatus).filter_by(date=today).all()
-    if not statuses:
-        session.close()
-        return update.message.reply_text("Bạn chưa có công việc nào 🤷‍♂️")
-    for i, st in enumerate(statuses):
-        t = st.task
-        icon = "✅" if st.done else "❌"
-        line = f"{i+1}. {icon} *{t.name}*"
-        if t.deadline:
-            line += f" _(due {t.deadline:%d-%m-%Y %H:%M})_"
-        buttons = []
-        if t.link:
-            buttons.append(InlineKeyboardButton("🔗 Hướng dẫn", url=t.link))
-        if buttons:
-            update.message.reply_text(
-                line,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([buttons])
-            )
+    lines = []
+    for st in statuses:
+        if st.done:
+            lines.append(f"✅ {st.task.name} — Bạn siêu đấy! 😉")
         else:
-            update.message.reply_text(line, parse_mode="Markdown")
+            lines.append(f"❌ {st.task.name} — Mau làm đi bạn ơi! 😜")
+    update.message.reply_text("📊 Tiến độ hôm nay:\n" + "\n".join(lines))
     session.close()
 
-def help_command(update: Update, ctx: CallbackContext):
-    text = (
-        "❓ *Hướng dẫn sử dụng Bot*:\n\n"
-        "• `/start` — Khởi động bot & menu\n"
-        "• `/tasks` — Xem công việc hôm nay\n"
-        "• `/list`  — Xem toàn bộ Task\n"
-        "• `/addtask Tên URL [DD-MM-YYYY] [HH:MM]` — Thêm Task\n"
-        "• `/removetask <số>` — Xóa Task trong danh sách hôm nay\n"
-        "• `/done <số>` — Đánh dấu / bỏ đánh dấu hoàn thành\n"
-        "• `/status` — Xem tiến độ hôm nay\n"
-        "• `/testreminder` — Gửi ngay nhắc việc để test\n\n"
-        "Bạn có thể bấm các nút bên dưới hoặc gõ lệnh."
-    )
-    update.message.reply_text(text, parse_mode="Markdown")
+# ——————————————————————————————————————————————
+# Gửi nhắc lập tức
+def do_reminder(ctx: CallbackContext):
+    job = []
+    session = SessionLocal()
+    ensure_today(session)
+    today = datetime.date.today()
+    undone = session.query(DailyStatus).filter_by(date=today, done=False).all()
+    session.close()
 
-def testreminder(update: Update, ctx: CallbackContext):
-    update.message.reply_text("🔔 (Test) Nhắc bạn kiểm tra công việc! Dùng /tasks")
+    if not undone:
+        return
+    lines = [f"{i+1}. {st.task.name}" for i, st in enumerate(undone)]
+    text = "🔔 Bạn vẫn còn task chưa hoàn thành:\n" + "\n".join(lines)
+    ctx.bot.send_message(chat_id=config.CHAT_ID, text=text)
 
-def schedule_reminder(updater):
-    def reminder_job():
-        session = SessionLocal()
-        ensure_today(session)
-        today = dt.date.today()
-        undone = session.query(DailyStatus).filter_by(date=today, done=False).all()
-        session.close()
-        if not undone:
-            return
-        lines = [f"{i+1}. {st.task.name}" for i, st in enumerate(undone)]
-        text = "🔔 Bạn vẫn còn công việc chưa hoàn thành hôm nay:\n" + "\n".join(lines)
-        updater.bot.send_message(chat_id=config.CHAT_ID, text=text)
-
-    sched = BackgroundScheduler(timezone=pytz.timezone('Asia/Ho_Chi_Minh'))
-    sched.add_job(reminder_job, trigger='cron', hour='9-23', minute=0)
+# ——————————————————————————————————————————————
+# Lịch nhắc 9–23h, mỗi giờ 1 lần
+def schedule_cron(updater: Updater):
+    sched = BackgroundScheduler()
+    trigger = CronTrigger(hour="9-23", minute=0, timezone="Asia/Ho_Chi_Minh")
+    sched.add_job(lambda: do_reminder(updater.dispatcher), trigger=trigger)
     sched.start()
+    print("[Scheduler] cron 9–23h mỗi giờ")
 
+# ——————————————————————————————————————————————
+def help_cmd(update: Update, ctx: CallbackContext):
+    update.message.reply_text("Bạn có thể dùng các lệnh: /tasks, /list, /addtask, /done, /removetask, /edittask, /status")
+
+# ——————————————————————————————————————————————
 def main():
     updater = Updater(token=config.API_TOKEN, use_context=True)
     dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start",       start))
-    dp.add_handler(CommandHandler("tasks",       tasks))
-    dp.add_handler(CommandHandler("list",        list_tasks))
-    dp.add_handler(CommandHandler("addtask",     addtask))
-    dp.add_handler(CommandHandler("removetask",  removetask))
-    dp.add_handler(CommandHandler("done",        done))
-    dp.add_handler(CommandHandler("status",      status))
-    dp.add_handler(CommandHandler("help",        help_command))
-    dp.add_handler(CommandHandler("testreminder",testreminder))
-    schedule_reminder(updater)
+
+    dp.add_handler(CommandHandler("start",   start))
+    dp.add_handler(CommandHandler("tasks",   tasks))
+    dp.add_handler(CommandHandler("list",    list_tasks))
+    dp.add_handler(CommandHandler("addtask", addtask))
+    dp.add_handler(CommandHandler("removetask", removetask))
+    dp.add_handler(CommandHandler("done",    done))
+    dp.add_handler(CommandHandler("edittask", edittask))
+    dp.add_handler(CommandHandler("status",  status))
+    dp.add_handler(CommandHandler("help",    help_cmd))
+
+    # khởi cron
+    schedule_cron(updater)
+
     updater.start_polling()
     updater.idle()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
